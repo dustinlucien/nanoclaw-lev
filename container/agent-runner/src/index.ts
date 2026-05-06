@@ -32,9 +32,24 @@ import { buildSystemPromptAddendum } from './destinations.js';
 import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import { runPollLoop } from './poll-loop.js';
+import type { McpServerConfig } from './providers/types.js';
 
 function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
+}
+
+/** Recursively expand ${VAR} references in all string values using process.env. */
+function expandEnvVars(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return value.replace(/\$\{([^}]+)\}/g, (_, k: string) => process.env[k] ?? '');
+  }
+  if (Array.isArray(value)) return value.map(expandEnvVars);
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, expandEnvVars(v)])
+    );
+  }
+  return value;
 }
 
 const CWD = '/workspace/agent';
@@ -72,8 +87,8 @@ async function main(): Promise<void> {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'mcp-tools', 'index.ts');
 
-  // Build MCP servers config: nanoclaw built-in + any from container.json
-  const mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> = {
+  // Build MCP servers config: nanoclaw built-in + container.json + .mcp.json
+  const mcpServers: Record<string, McpServerConfig> = {
     nanoclaw: {
       command: 'bun',
       args: ['run', mcpServerPath],
@@ -83,7 +98,33 @@ async function main(): Promise<void> {
 
   for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
     mcpServers[name] = serverConfig;
-    log(`Additional MCP server: ${name} (${serverConfig.command})`);
+    log(`Additional MCP server: ${name} (${'command' in serverConfig ? serverConfig.command : serverConfig.url})`);
+  }
+
+  // Merge project-level .mcp.json — cross-platform MCP servers shared between
+  // this container and Claude Code on the host (laptop). container.json entries
+  // win on conflicts; 'nanoclaw' is reserved and always skipped.
+  const MCP_JSON_PATH = `${CWD}/.mcp.json`;
+  if (fs.existsSync(MCP_JSON_PATH)) {
+    try {
+      const mcpJson = JSON.parse(fs.readFileSync(MCP_JSON_PATH, 'utf8')) as {
+        mcpServers?: Record<string, unknown>;
+      };
+      for (const [name, entry] of Object.entries(mcpJson.mcpServers ?? {})) {
+        if (name === 'nanoclaw') {
+          log(`Skipping .mcp.json entry "${name}" — reserved`);
+          continue;
+        }
+        if (config.mcpServers[name]) {
+          log(`Skipping .mcp.json entry "${name}" — overridden by container.json`);
+          continue;
+        }
+        mcpServers[name] = expandEnvVars(entry) as McpServerConfig;
+        log(`MCP server from .mcp.json: ${name}`);
+      }
+    } catch (err) {
+      log(`[warn] Failed to parse .mcp.json: ${err}`);
+    }
   }
 
   const provider = createProvider(providerName, {
