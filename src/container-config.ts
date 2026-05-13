@@ -47,6 +47,19 @@ export interface ContainerConfig {
   agentGroupId?: string;
   /** Max messages per prompt. Falls back to code default if unset. */
   maxMessagesPerPrompt?: number;
+  /**
+   * Mount the host's ~/.ssh directory into the container at /home/node/.ssh
+   * (read-only). Enables git over SSH and other SSH-based tools inside the
+   * agent. Not configurable via the self-mod flow — host-level config only.
+   */
+  sshMount?: boolean;
+  /**
+   * List of paths relative to ~ on the host to mount read-only at the
+   * corresponding path under /home/node/ in the container. Example:
+   * [".config/gh"] mounts ~/.config/gh → /home/node/.config/gh.
+   * Not configurable via the self-mod flow — host-level config only.
+   */
+  homeMounts?: string[];
 }
 
 function emptyConfig(): ContainerConfig {
@@ -87,6 +100,8 @@ export function readContainerConfig(folder: string): ContainerConfig {
       assistantName: raw.assistantName,
       agentGroupId: raw.agentGroupId,
       maxMessagesPerPrompt: raw.maxMessagesPerPrompt,
+      sshMount: raw.sshMount,
+      homeMounts: raw.homeMounts,
     };
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);

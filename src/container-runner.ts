@@ -5,6 +5,7 @@
  */
 import { ChildProcess, execSync, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import { OneCLI } from '@onecli-sh/sdk';
@@ -318,6 +319,31 @@ function buildMounts(
   const skillsSrc = path.join(projectRoot, 'container', 'skills');
   if (fs.existsSync(skillsSrc)) {
     mounts.push({ hostPath: skillsSrc, containerPath: '/app/skills', readonly: true });
+  }
+
+  // Home directory sub-path mounts — each entry is relative to ~ on the host,
+  // mounted read-only at the same relative path under /home/node/ in the container.
+  if (containerConfig.homeMounts && containerConfig.homeMounts.length > 0) {
+    const homeDir = os.homedir();
+    for (const rel of containerConfig.homeMounts) {
+      const hostPath = path.join(homeDir, rel);
+      const containerPath = `/home/node/${rel}`;
+      if (fs.existsSync(hostPath)) {
+        mounts.push({ hostPath, containerPath, readonly: true });
+      } else {
+        log.warn('homeMounts entry does not exist on host — skipping', { group: agentGroup.name, path: hostPath });
+      }
+    }
+  }
+
+  // SSH mount — read-only, so the agent can use git over SSH and other SSH tools.
+  if (containerConfig.sshMount) {
+    const hostSshDir = path.join(os.homedir(), '.ssh');
+    if (fs.existsSync(hostSshDir)) {
+      mounts.push({ hostPath: hostSshDir, containerPath: '/home/node/.ssh', readonly: true });
+    } else {
+      log.warn('sshMount enabled but ~/.ssh does not exist on host — skipping', { group: agentGroup.name });
+    }
   }
 
   // Additional mounts from container config
