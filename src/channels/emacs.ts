@@ -3,38 +3,40 @@ import http from 'http';
 import path from 'path';
 
 import { GROUPS_DIR } from '../config.js';
-import { setRegisteredGroup } from '../db.js';
 import { readEnvFile } from '../env.js';
-import { logger } from '../logger.js';
-import { Channel, RegisteredGroup } from '../types.js';
-import { ChannelOpts, registerChannel } from './registry.js';
+import { log } from '../log.js';
+import { registerChannelAdapter } from './channel-registry.js';
+import type { ChannelAdapter, ChannelSetup, OutboundMessage } from './adapter.js';
 
-const EMACS_JID = 'emacs:default';
+const EMACS_CHANNEL_TYPE = 'emacs';
+const EMACS_PLATFORM_ID = 'emacs:default';
 
 interface BufferedMessage {
   text: string;
   timestamp: number;
 }
 
-export class EmacsBridgeChannel implements Channel {
+export class EmacsBridgeAdapter implements ChannelAdapter {
   name = 'emacs';
+  channelType = EMACS_CHANNEL_TYPE;
+  supportsThreads = false;
 
   private server: http.Server | null = null;
   private port: number;
   private authToken: string | null;
-  private opts: ChannelOpts;
   private buffer: BufferedMessage[] = [];
+  private setup_: ChannelSetup | null = null;
 
-  constructor(port: number, authToken: string | null, opts: ChannelOpts) {
+  constructor(port: number, authToken: string | null) {
     this.port = port;
     this.authToken = authToken;
-    this.opts = opts;
   }
 
-  async connect(): Promise<void> {
-    this.ensureGroupRegistered();
-    this.ensureSymlink();
+  async setup(config: ChannelSetup): Promise<void> {
+    this.setup_ = config;
     this.ensureClaudeMd();
+
+    config.onMetadata(EMACS_PLATFORM_ID, 'Emacs', false);
 
     this.server = http.createServer((req, res) => {
       if (!this.checkAuth(req, res)) return;
@@ -52,36 +54,32 @@ export class EmacsBridgeChannel implements Channel {
 
     await new Promise<void>((resolve, reject) => {
       this.server!.listen(this.port, '127.0.0.1', () => {
-        logger.info({ port: this.port }, 'Emacs channel listening — load emacs/nanoclaw.el to connect');
+        log.info('Emacs channel listening — load emacs/nanoclaw.el to connect', { port: this.port });
         resolve();
       });
       this.server!.once('error', reject);
     });
   }
 
-  async disconnect(): Promise<void> {
+  async teardown(): Promise<void> {
     if (this.server) {
       await new Promise<void>((resolve) => this.server!.close(() => resolve()));
       this.server = null;
-      logger.info('Emacs channel stopped');
+      log.info('Emacs channel stopped');
     }
   }
 
-  async sendMessage(_jid: string, text: string): Promise<void> {
+  async deliver(_platformId: string, _threadId: string | null, message: OutboundMessage): Promise<string | undefined> {
+    const parsed = message.content as Record<string, unknown>;
+    const text = typeof parsed?.text === 'string' ? parsed.text : JSON.stringify(parsed);
     this.buffer.push({ text, timestamp: Date.now() });
-    // Keep buffer bounded — 200 messages max
     if (this.buffer.length > 200) this.buffer.shift();
+    return undefined;
   }
 
   isConnected(): boolean {
     return this.server?.listening ?? false;
   }
-
-  ownsJid(jid: string): boolean {
-    return jid === EMACS_JID;
-  }
-
-  // --- Private helpers ---
 
   private checkAuth(req: http.IncomingMessage, res: http.ServerResponse): boolean {
     if (!this.authToken) return true;
@@ -105,24 +103,22 @@ export class EmacsBridgeChannel implements Channel {
         const timestamp = new Date().toISOString();
         const msgId = `emacs-${Date.now()}`;
 
-        this.opts.onChatMetadata(EMACS_JID, timestamp, 'Emacs', 'emacs', false);
-        this.opts.onMessage(EMACS_JID, {
+        this.setup_?.onInbound(EMACS_PLATFORM_ID, null, {
           id: msgId,
-          chat_jid: EMACS_JID,
-          sender: 'emacs',
-          sender_name: 'Emacs',
-          content: text,
+          kind: 'chat',
+          content: { text, sender: 'Emacs', senderId: 'emacs' },
           timestamp,
-          is_from_me: false,
+          isMention: true,
+          isGroup: false,
         });
 
         res
           .writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
           .end(JSON.stringify({ messageId: msgId, timestamp: Date.now() }));
 
-        logger.info({ length: text.length }, 'Emacs message received');
+        log.info('Emacs message received', { length: text.length });
       } catch (err) {
-        logger.error({ err }, 'Emacs channel: failed to parse POST body');
+        log.error('Emacs channel: failed to parse POST body', { err });
         res.writeHead(400).end(JSON.stringify({ error: 'Invalid JSON' }));
       }
     });
@@ -136,10 +132,9 @@ export class EmacsBridgeChannel implements Channel {
 
   private ensureClaudeMd(): void {
     const claudeMd = path.join(GROUPS_DIR, 'emacs', 'CLAUDE.md');
-    // groups/emacs symlinks to the main group folder on typical installs, so
-    // this is a no-op when that CLAUDE.md already exists. On a fresh setup it
-    // bootstraps the file so the agent knows to output markdown, not org-mode.
     if (fs.existsSync(claudeMd)) return;
+    const dir = path.dirname(claudeMd);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     const content = [
       '## Message Formatting',
       '',
@@ -159,72 +154,19 @@ export class EmacsBridgeChannel implements Channel {
     ].join('\n');
     try {
       fs.writeFileSync(claudeMd, content, 'utf8');
-      logger.info('Emacs channel: wrote CLAUDE.md');
+      log.info('Emacs channel: wrote CLAUDE.md');
     } catch (err) {
-      logger.warn({ err }, 'Emacs channel: could not write CLAUDE.md');
-    }
-  }
-
-  private ensureGroupRegistered(): void {
-    const groups = this.opts.registeredGroups();
-    if (groups[EMACS_JID]) return;
-
-    const newGroup: RegisteredGroup = {
-      name: 'emacs',
-      folder: 'emacs',
-      trigger: '',
-      added_at: new Date().toISOString(),
-      requiresTrigger: false,
-    };
-
-    try {
-      setRegisteredGroup(EMACS_JID, newGroup);
-      // Mutate the live cache so the message loop sees it immediately
-      groups[EMACS_JID] = newGroup;
-      logger.info('Emacs group auto-registered');
-    } catch (err) {
-      logger.error({ err }, 'Emacs channel: failed to auto-register group');
-    }
-  }
-
-  private ensureSymlink(): void {
-    const emacsDir = path.join(GROUPS_DIR, 'emacs');
-
-    // Find the main group's folder name
-    const groups = this.opts.registeredGroups();
-    const mainGroup = Object.values(groups).find((g) => g.isMain);
-    const targetFolder = mainGroup?.folder ?? 'main';
-    const targetDir = path.join(GROUPS_DIR, targetFolder);
-
-    try {
-      const stat = fs.lstatSync(emacsDir);
-      if (stat.isSymbolicLink()) return; // already set up
-      // Exists as a real directory — leave it alone
-      logger.debug({ emacsDir }, 'Emacs groups dir already exists as a directory');
-      return;
-    } catch {
-      // Does not exist — create it
-    }
-
-    // Ensure the target exists before symlinking
-    if (!fs.existsSync(targetDir)) {
-      fs.mkdirSync(targetDir, { recursive: true });
-    }
-
-    try {
-      fs.symlinkSync(targetDir, emacsDir);
-      logger.info({ target: targetDir }, 'Created groups/emacs symlink');
-    } catch (err) {
-      logger.error({ err }, 'Emacs channel: failed to create groups/emacs symlink');
+      log.warn('Emacs channel: could not write CLAUDE.md', { err });
     }
   }
 }
 
-registerChannel('emacs', (opts: ChannelOpts) => {
-  const envVars = readEnvFile(['EMACS_CHANNEL_PORT', 'EMACS_AUTH_TOKEN']);
-  const portStr = process.env.EMACS_CHANNEL_PORT || envVars.EMACS_CHANNEL_PORT || '8766';
-  const port = parseInt(portStr, 10);
-  const authToken = process.env.EMACS_AUTH_TOKEN || envVars.EMACS_AUTH_TOKEN || null;
-
-  return new EmacsBridgeChannel(port, authToken, opts);
+registerChannelAdapter('emacs', {
+  factory: () => {
+    const envVars = readEnvFile(['EMACS_CHANNEL_PORT', 'EMACS_AUTH_TOKEN']);
+    const portStr = process.env.EMACS_CHANNEL_PORT || envVars.EMACS_CHANNEL_PORT || '8766';
+    const port = parseInt(portStr, 10);
+    const authToken = process.env.EMACS_AUTH_TOKEN || envVars.EMACS_AUTH_TOKEN || null;
+    return new EmacsBridgeAdapter(port, authToken);
+  },
 });
