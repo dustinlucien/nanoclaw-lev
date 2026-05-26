@@ -9,3 +9,4 @@
 import './cli.js';
 import './telegram.js';
 import './emacs.js';
+import './imessage.js';
